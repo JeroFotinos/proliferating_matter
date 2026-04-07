@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation, PillowWriter
 
 from core import SquareLattice, SimulationResult, CultureState
-
 
 def plot_population_curves(results: list[SimulationResult], labels: list[str]) -> None:
     """
@@ -116,15 +118,7 @@ def summarize_simulation(result: SimulationResult, model_name: str) -> None:
     print(f"Number of events: {result.event_count}")
 
 
-from __future__ import annotations
-
-from pathlib import Path
-
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation, PillowWriter
-
-from core import SquareLattice, SimulationResult
+# ======= Animation utilities =======
 
 
 def animate_snapshots(
