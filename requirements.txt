@@ -1,0 +1,33 @@
+ipython
+notebook
+jupyterlab
+
+numpy
+pandas
+matplotlib
+seaborn
+scipy
+scikit-learn
+statsmodels
+
+black
+isort
+flake8
+black[jupyter]
+
+# pytest
+# coverage
+# pytest-cov
+# ipdb
+# tox
+# tuna
+# pyprof2calltree
+# line_profiler[all]
+rich
+rich[jupyter]
+# statprof-smarkets
+# sphinx
+
+scikit-image
+# napari[all]
+magicgui
