@@ -420,22 +420,23 @@ class HoneycombLattice(Lattice):
 
     def _build_neighbor_table(self) -> list[np.ndarray]:
         table: list[np.ndarray] = []
+
         for site in range(self.n_sites):
             r, c = self.to_row_col(site)
             neigh = []
 
-            if r % 2 == 0:
-                candidates = [
-                    (r, c - 1),
-                    (r, c + 1),
-                    (r - 1, c),
-                ]
+            # Horizontal neighbors
+            candidates = [
+                (r, c - 1),
+                (r, c + 1),
+            ]
+
+            # One vertical neighbor, chosen by checkerboard parity
+            # so the edge is reciprocal and the graph is fully connected.
+            if (r + c) % 2 == 0:
+                candidates.append((r + 1, c))
             else:
-                candidates = [
-                    (r, c - 1),
-                    (r, c + 1),
-                    (r + 1, c),
-                ]
+                candidates.append((r - 1, c))
 
             for rr, cc in candidates:
                 if self.periodic:
@@ -447,6 +448,7 @@ class HoneycombLattice(Lattice):
                         neigh.append(self.site_index(rr, cc))
 
             table.append(np.array(neigh, dtype=int))
+
         return table
 
 
