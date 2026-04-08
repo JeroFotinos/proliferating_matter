@@ -1,54 +1,241 @@
 from __future__ import annotations
 
-from pathlib import Path
+from dataclasses import asdict
+from typing import Iterable, Optional
 
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation, PillowWriter
 
-from core import SquareLattice, SimulationResult, CultureState
+from core import (
+    Lattice,
+    SquareLattice,
+    TriangularLattice,
+    HoneycombLattice,
+    SimulationResult,
+)
 
-def plot_population_curves(results: list[SimulationResult], labels: list[str]) -> None:
+
+# ============================================================
+# Result conversion and aggregation
+# ============================================================
+
+def result_to_frame(
+    result: SimulationResult,
+    run_id: Optional[int] = None,
+    extra_columns: Optional[dict] = None,
+) -> pd.DataFrame:
+    df = pd.DataFrame(
+        {
+            "time": result.times,
+            "population": result.population,
+            "density": result.density,
+            "mean_radius": result.mean_radius,
+            "equiv_radius": result.equiv_radius,
+            "roughness": result.roughness,
+            "n_active": result.n_active,
+            "center_x": result.center_x,
+            "center_y": result.center_y,
+            "front_velocity": result.front_velocity,
+        }
+    )
+
+    if run_id is not None:
+        df["run_id"] = run_id
+
+    if extra_columns is not None:
+        for key, value in extra_columns.items():
+            df[key] = value
+
+    return df
+
+
+def aggregate_results(
+    results: list[SimulationResult],
+    times: Optional[np.ndarray] = None,
+) -> pd.DataFrame:
     """
-    Plot cell count versus time for several simulations.
+    Aggregate an ensemble of runs observed on the same time grid.
+
+    Assumes all runs were recorded at the same observation times.
     """
+    if len(results) == 0:
+        raise ValueError("results must be non-empty.")
+
+    reference_times = results[0].times
+    for result in results[1:]:
+        if not np.allclose(result.times, reference_times):
+            raise ValueError("All results must share the same observation times.")
+
+    pop = np.vstack([r.population for r in results])
+    dens = np.vstack([r.density for r in results])
+    rad = np.vstack([r.mean_radius for r in results])
+    req = np.vstack([r.equiv_radius for r in results])
+    rough = np.vstack([r.roughness for r in results])
+    vel = np.vstack([r.front_velocity for r in results])
+
+    survival = (pop > 0).astype(float)
+
+    df = pd.DataFrame(
+        {
+            "time": reference_times,
+            "mean_population": pop.mean(axis=0),
+            "std_population": pop.std(axis=0, ddof=0),
+            "survival_probability": survival.mean(axis=0),
+            "mean_density": dens.mean(axis=0),
+            "std_density": dens.std(axis=0, ddof=0),
+            "mean_radius": np.nanmean(rad, axis=0),
+            "std_radius": np.nanstd(rad, axis=0, ddof=0),
+            "mean_equiv_radius": np.nanmean(req, axis=0),
+            "mean_roughness": np.nanmean(rough, axis=0),
+            "std_roughness": np.nanstd(rough, axis=0, ddof=0),
+            "mean_front_velocity": np.nanmean(vel, axis=0),
+            "std_front_velocity": np.nanstd(vel, axis=0, ddof=0),
+        }
+    )
+    return df
+
+
+# ============================================================
+# Power-law fitting helpers
+# ============================================================
+
+def fit_power_law_exponent(
+    times: np.ndarray,
+    values: np.ndarray,
+    t_min: Optional[float] = None,
+    t_max: Optional[float] = None,
+) -> dict:
+    """
+    Fit values ~ C * t^alpha by linear regression in log-log scale.
+
+    Only positive finite time/value pairs are used.
+
+    Parameters
+    ----------
+    times : array-like
+        Time points corresponding to the observed values.
+    values : array-like
+        Observed values to fit.
+    t_min : float, optional
+        Minimum time to include in the fit. If None, no minimum is applied.
+    t_max : float, optional
+        Maximum time to include in the fit. If None, no maximum is applied.
+
+    Returns
+    -------
+    dict
+        A dictionary containing the fitted exponent 'alpha', the log of the
+        prefactor 'log_C', the prefactor 'C', the R^2 of the log-log fit
+        'r2_loglog', and the number of points used in the fit 'n_points'.
+    """
+    times = np.asarray(times, dtype=float)
+    values = np.asarray(values, dtype=float)
+
+    mask = np.isfinite(times) & np.isfinite(values) & (times > 0.0) & (values > 0.0)
+
+    if t_min is not None:
+        mask &= times >= t_min
+    if t_max is not None:
+        mask &= times <= t_max
+
+    t_fit = times[mask]
+    y_fit = values[mask]
+
+    if t_fit.size < 2:
+        raise ValueError("Not enough valid points for a power-law fit.")
+
+    log_t = np.log(t_fit)
+    log_y = np.log(y_fit)
+
+    slope, intercept = np.polyfit(log_t, log_y, deg=1)
+
+    y_pred = slope * log_t + intercept
+    ss_res = np.sum((log_y - y_pred) ** 2)
+    ss_tot = np.sum((log_y - log_y.mean()) ** 2)
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+
+    return {
+        "alpha": float(slope),
+        "log_C": float(intercept),
+        "C": float(np.exp(intercept)),
+        "r2_loglog": float(r2),
+        "n_points": int(t_fit.size),
+    }
+
+
+# ============================================================
+# Plotting
+# ============================================================
+
+def plot_observables(
+    result: SimulationResult,
+    which: tuple[str, ...] = ("population", "mean_radius", "roughness", "front_velocity"),
+    title_prefix: str = "",
+) -> None:
+    n_panels = len(which)
+    fig, axes = plt.subplots(n_panels, 1, figsize=(8, 3 * n_panels), squeeze=False)
+
+    for ax, key in zip(axes[:, 0], which):
+        values = getattr(result, key)
+        ax.plot(result.times, values)
+        ax.set_xlabel("Time")
+        ax.set_ylabel(key)
+        ax.set_title(f"{title_prefix}{key}")
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_ensemble_curve(
+    agg_df: pd.DataFrame,
+    y: str,
+    y_std: Optional[str] = None,
+    title: Optional[str] = None,
+) -> None:
     plt.figure(figsize=(8, 5))
+    plt.plot(agg_df["time"], agg_df[y], label=y)
 
-    for result, label in zip(results, labels):
-        plt.step(result.times, result.cell_counts, where="post", label=label)
+    if y_std is not None:
+        lower = agg_df[y] - agg_df[y_std]
+        upper = agg_df[y] + agg_df[y_std]
+        plt.fill_between(agg_df["time"], lower, upper, alpha=0.25)
 
     plt.xlabel("Time")
-    plt.ylabel("Number of occupied sites")
-    plt.title("Cell culture growth")
-    plt.legend()
+    plt.ylabel(y)
+    if title is not None:
+        plt.title(title)
     plt.tight_layout()
     plt.show()
 
 
 def plot_snapshots(
-    lattice: SquareLattice,
+    lattice: Lattice,
     result: SimulationResult,
     times_to_show: list[float],
     title_prefix: str = "",
+    cmap: str = "binary",
 ) -> None:
     """
-    Plot occupancy snapshots with an explicit binary colormap.
+    Plot occupancy snapshots.
 
-    Convention:
-    - 0 = empty   -> white
+    Convention with cmap='binary':
+    - 0 = empty -> white
     - 1 = occupied -> black
     """
+    if result.snapshots is None:
+        raise ValueError("This result does not contain snapshots. Run with store_snapshots=True.")
+
     n = len(times_to_show)
     fig, axes = plt.subplots(1, n, figsize=(4 * n, 4), squeeze=False)
 
     for ax, ts in zip(axes[0], times_to_show):
         arr = lattice.reshape_state(result.snapshots[float(ts)]).astype(int)
-
         ax.imshow(
             arr,
             origin="lower",
             interpolation="nearest",
-            cmap="binary",
+            cmap=cmap,
             vmin=0,
             vmax=1,
         )
@@ -58,217 +245,3 @@ def plot_snapshots(
 
     plt.tight_layout()
     plt.show()
-
-
-def plot_birth_time(
-    lattice: SquareLattice,
-    state: CultureState,
-    title: str = "Birth time of occupied sites",
-) -> None:
-    """
-    Plot the birth-time field. Empty sites are masked.
-    """
-    birth = state.birth_time.copy()
-    img = lattice.reshape_state(birth)
-
-    masked = np.ma.masked_invalid(img)
-
-    plt.figure(figsize=(6, 6))
-    im = plt.imshow(masked, origin="lower", interpolation="nearest")
-    plt.colorbar(im, label="Birth time")
-    plt.title(title)
-    plt.xlabel("Column")
-    plt.ylabel("Row")
-    plt.tight_layout()
-    plt.show()
-
-
-def plot_cell_id(
-    lattice: SquareLattice,
-    state: CultureState,
-    title: str = "Cell id map",
-) -> None:
-    """
-    Plot cell ids for occupied sites. Empty sites are masked.
-    """
-    values = state.cell_id.astype(float)
-    values[values < 0] = np.nan
-    img = lattice.reshape_state(values)
-
-    masked = np.ma.masked_invalid(img)
-
-    plt.figure(figsize=(6, 6))
-    im = plt.imshow(masked, origin="lower", interpolation="nearest")
-    plt.colorbar(im, label="Cell id")
-    plt.title(title)
-    plt.xlabel("Column")
-    plt.ylabel("Row")
-    plt.tight_layout()
-    plt.show()
-
-
-def summarize_simulation(result: SimulationResult, model_name: str) -> None:
-    """
-    Print a compact textual summary.
-    """
-    print(f"Model: {model_name}")
-    print(f"Final time: {result.times[-1]:.6f}")
-    print(f"Initial cells: {result.cell_counts[0]}")
-    print(f"Final cells: {result.cell_counts[-1]}")
-    print(f"Number of events: {result.event_count}")
-
-
-# ======= Animation utilities =======
-
-
-def animate_snapshots(
-    lattice: SquareLattice,
-    result: SimulationResult,
-    times_to_show: list[float],
-    interval: int = 100,
-    title_prefix: str = "",
-    cmap: str = "binary",
-):
-    """
-    Create a matplotlib animation from stored occupancy snapshots.
-
-    Parameters
-    ----------
-    lattice : SquareLattice
-        Lattice used in the simulation.
-    result : SimulationResult
-        Simulation output containing snapshots.
-    times_to_show : list[float]
-        Ordered list of times to animate.
-    interval : int, default=100
-        Delay between frames in milliseconds.
-    title_prefix : str, default=""
-        Prefix added to the title of each frame.
-    cmap : str, default="binary"
-        Colormap for occupancy. With 'binary':
-        - 0 = empty -> white
-        - 1 = occupied -> black
-
-    Returns
-    -------
-    anim : matplotlib.animation.FuncAnimation
-        Animation object.
-    fig : matplotlib.figure.Figure
-        Figure object.
-    ax : matplotlib.axes.Axes
-        Axes object.
-    """
-    fig, ax = plt.subplots(figsize=(6, 6))
-
-    first_frame = lattice.reshape_state(result.snapshots[float(times_to_show[0])]).astype(int)
-
-    im = ax.imshow(
-        first_frame,
-        origin="lower",
-        interpolation="nearest",
-        cmap=cmap,
-        vmin=0,
-        vmax=1,
-        animated=True,
-    )
-
-    title = ax.set_title(f"{title_prefix}t = {times_to_show[0]:.3f}")
-    ax.set_xlabel("Column")
-    ax.set_ylabel("Row")
-
-    def update(frame_idx: int):
-        t = float(times_to_show[frame_idx])
-        arr = lattice.reshape_state(result.snapshots[t]).astype(int)
-        im.set_array(arr)
-        title.set_text(f"{title_prefix}t = {t:.3f}")
-        return im, title
-
-    anim = FuncAnimation(
-        fig,
-        update,
-        frames=len(times_to_show),
-        interval=interval,
-        blit=False,
-        repeat=False,
-    )
-
-    return anim, fig, ax
-
-
-def save_gif(
-    lattice: SquareLattice,
-    result: SimulationResult,
-    times_to_show: list[float],
-    filename: str,
-    fps: int = 10,
-    title_prefix: str = "",
-    cmap: str = "binary",
-) -> None:
-    """
-    Save a GIF animation from stored occupancy snapshots.
-
-    Parameters
-    ----------
-    lattice : SquareLattice
-        Lattice used in the simulation.
-    result : SimulationResult
-        Simulation output containing snapshots.
-    times_to_show : list[float]
-        Ordered list of times to animate.
-    filename : str
-        Output GIF filename.
-    fps : int, default=10
-        Frames per second in the output GIF.
-    title_prefix : str, default=""
-        Prefix added to the title of each frame.
-    cmap : str, default="binary"
-        Colormap for occupancy.
-    """
-    filename = str(Path(filename))
-
-    anim, fig, ax = animate_snapshots(
-        lattice=lattice,
-        result=result,
-        times_to_show=times_to_show,
-        interval=int(1000 / fps),
-        title_prefix=title_prefix,
-        cmap=cmap,
-    )
-
-    writer = PillowWriter(fps=fps)
-    anim.save(filename, writer=writer)
-    plt.close(fig)
-
-
-def save_mp4(
-    lattice: SquareLattice,
-    result: SimulationResult,
-    times_to_show: list[float],
-    filename: str,
-    fps: int = 10,
-    title_prefix: str = "",
-    cmap: str = "binary",
-) -> None:
-    """
-    Save an MP4 animation from stored occupancy snapshots.
-
-    Notes
-    -----
-    This requires ffmpeg to be installed and available in PATH.
-    """
-    from matplotlib.animation import FFMpegWriter
-
-    filename = str(Path(filename))
-
-    anim, fig, ax = animate_snapshots(
-        lattice=lattice,
-        result=result,
-        times_to_show=times_to_show,
-        interval=int(1000 / fps),
-        title_prefix=title_prefix,
-        cmap=cmap,
-    )
-
-    writer = FFMpegWriter(fps=fps)
-    anim.save(filename, writer=writer)
-    plt.close(fig)
