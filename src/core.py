@@ -12,18 +12,12 @@ import numpy as np
 # ============================================================
 
 def _sorted_int_array(values: set[int]) -> np.ndarray:
-    """
-    Convert a set of integers into a sorted NumPy array.
-    """
     if not values:
         return np.array([], dtype=int)
     return np.array(sorted(values), dtype=int)
 
 
 def _sample_uniform_from_array(arr: np.ndarray, rng: np.random.Generator) -> int:
-    """
-    Sample one element uniformly from a 1D NumPy array.
-    """
     if arr.size == 0:
         raise ValueError("Cannot sample from an empty array.")
     idx = int(rng.integers(arr.size))
@@ -34,12 +28,6 @@ def _sample_index_from_positive_weights(
     weights: np.ndarray,
     rng: np.random.Generator,
 ) -> int:
-    """
-    Sample an index with probability proportional to positive weights.
-
-    Uses one uniform random draw and a cumulative sum. This makes the
-    sampling logic explicit and stable within a fixed code version.
-    """
     total = float(weights.sum())
     if total <= 0.0:
         raise ValueError("Weights must have positive sum.")
@@ -47,12 +35,91 @@ def _sample_index_from_positive_weights(
     u = rng.random() * total
     cumsum = np.cumsum(weights)
     idx = int(np.searchsorted(cumsum, u, side="right"))
-
-    # Numerical safety in case u lands extremely close to total
     if idx >= weights.size:
         idx = weights.size - 1
-
     return idx
+
+
+# ============================================================
+# Fenwick tree for exact O(log N) weighted updates/sampling
+# ============================================================
+
+class FenwickTree:
+    """
+    Fenwick tree (binary indexed tree) for nonnegative weights.
+
+    Supports:
+    - point updates in O(log N)
+    - total sum in O(1)
+    - exact weighted sampling by prefix inversion in O(log N)
+    """
+
+    def __init__(self, size: int):
+        if size < 0:
+            raise ValueError("size must be non-negative.")
+        self.size = int(size)
+        self.tree = np.zeros(self.size + 1, dtype=float)
+        self.values = np.zeros(self.size, dtype=float)
+
+    def total(self) -> float:
+        return float(self.tree[self.size]) if self.size > 0 else 0.0
+
+    def get(self, index: int) -> float:
+        return float(self.values[index])
+
+    def set(self, index: int, value: float) -> None:
+        value = float(value)
+        if value < 0.0:
+            raise ValueError("Fenwick weights must be nonnegative.")
+
+        delta = value - self.values[index]
+        if delta == 0.0:
+            return
+
+        self.values[index] = value
+        i = index + 1
+        while i <= self.size:
+            self.tree[i] += delta
+            i += i & -i
+
+    def build(self, values: np.ndarray) -> None:
+        values = np.asarray(values, dtype=float)
+        if values.shape != (self.size,):
+            raise ValueError("build array has incorrect shape.")
+        if np.any(values < 0.0):
+            raise ValueError("Fenwick weights must be nonnegative.")
+
+        self.tree.fill(0.0)
+        self.values = values.copy()
+
+        for i in range(self.size):
+            j = i + 1
+            self.tree[j] += self.values[i]
+            parent = j + (j & -j)
+            if parent <= self.size:
+                self.tree[parent] += self.tree[j]
+
+    def sample(self, rng: np.random.Generator) -> int:
+        total = float(self.values.sum())
+        if total <= 0.0:
+            raise ValueError("Cannot sample from zero-total Fenwick tree.")
+
+        target = rng.random() * total
+
+        idx = 0
+        bit = 1 << (self.size.bit_length() - 1) if self.size > 0 else 0
+        running = 0.0
+
+        while bit != 0:
+            nxt = idx + bit
+            if nxt <= self.size and running + self.tree[nxt] <= target:
+                idx = nxt
+                running += self.tree[nxt]
+            bit >>= 1
+
+        if idx >= self.size:
+            idx = self.size - 1
+        return int(idx)
 
 
 # ============================================================
@@ -500,19 +567,28 @@ class CultureState:
         for site in candidates:
             self._recompute_frontier_site(lattice, site)
 
-    def update_frontier_local(self, lattice: Lattice, changed_site: int) -> None:
+    def get_local_affected_sites(self, lattice: Lattice, changed_site: int) -> set[int]:
+        """
+        Return the local neighborhood whose frontier membership and/or local
+        rates may change after flipping occupancy at changed_site.
+
+        We include the second shell because birth rates can depend on the
+        coordination number of nearby empty sites.
+        """
         affected = {int(changed_site)}
         first_shell = lattice.neighbors(changed_site)
         affected.update(int(x) for x in first_shell)
 
-        # Second shell is included because changing one site can modify the
-        # coordination number of neighboring empty sites, which can in turn
-        # modify the effective rates of nearby parents/targets.
         for site in first_shell:
             affected.update(int(x) for x in lattice.neighbors(int(site)))
 
+        return affected
+
+    def update_frontier_local(self, lattice: Lattice, changed_site: int) -> set[int]:
+        affected = self.get_local_affected_sites(lattice, changed_site)
         for site in affected:
             self._recompute_frontier_site(lattice, site)
+        return affected
 
 
 # ============================================================
@@ -569,13 +645,6 @@ class BoltzmannModifier(LocalRateModifier):
 # Birth kernels
 # ============================================================
 
-@dataclass
-class BirthProposal:
-    total_rate: float
-    sites: np.ndarray
-    site_rates: np.ndarray
-
-
 class BirthKernel(ABC):
     @property
     @abstractmethod
@@ -583,19 +652,20 @@ class BirthKernel(ABC):
         pass
 
     @abstractmethod
-    def prepare(
+    def compute_site_rate(
         self,
         state: CultureState,
         lattice: Lattice,
+        site: int,
         r_birth: float,
         birth_modifier: LocalRateModifier,
-    ) -> BirthProposal:
+    ) -> float:
         pass
 
     @abstractmethod
-    def sample_event(
+    def sample_event_from_site(
         self,
-        proposal: BirthProposal,
+        site: int,
         state: CultureState,
         lattice: Lattice,
         r_birth: float,
@@ -610,64 +680,54 @@ class CellDrivenBirthKernel(BirthKernel):
     def name(self) -> str:
         return "cell_driven"
 
-    def prepare(
+    def compute_site_rate(
         self,
         state: CultureState,
         lattice: Lattice,
+        site: int,
         r_birth: float,
         birth_modifier: LocalRateModifier,
-    ) -> BirthProposal:
-        if len(state.active_sites) == 0 or r_birth <= 0.0:
-            return BirthProposal(0.0, np.array([], dtype=int), np.array([], dtype=float))
+    ) -> float:
+        if r_birth <= 0.0:
+            return 0.0
+        if site not in state.active_sites:
+            return 0.0
+
+        if isinstance(birth_modifier, NoAdhesion):
+            return float(r_birth)
 
         z = lattice.coordination_number
-        parents = _sorted_int_array(state.active_sites)
-        rates = np.empty(parents.size, dtype=float)
+        empty_neigh = lattice.empty_neighbor_sites(state.occupancy, site)
+        m = empty_neigh.size
+        if m == 0:
+            return 0.0
 
-        no_adhesion = isinstance(birth_modifier, NoAdhesion)
+        s = 0.0
+        for target in empty_neigh:
+            k_target = lattice.occupied_neighbor_count(state.occupancy, int(target))
+            s += birth_modifier.effective_rate(r_birth, k_target, z)
 
-        for i, parent in enumerate(parents):
-            empty_neigh = lattice.empty_neighbor_sites(state.occupancy, int(parent))
-            m = empty_neigh.size
+        return s / m
 
-            if m == 0:
-                rates[i] = 0.0
-                continue
-
-            if no_adhesion:
-                rates[i] = r_birth
-            else:
-                s = 0.0
-                for target in empty_neigh:
-                    k_target = lattice.occupied_neighbor_count(state.occupancy, int(target))
-                    s += birth_modifier.effective_rate(r_birth, k_target, z)
-                rates[i] = s / m
-
-        total_rate = float(rates.sum())
-        return BirthProposal(total_rate=total_rate, sites=parents, site_rates=rates)
-
-    def sample_event(
+    def sample_event_from_site(
         self,
-        proposal: BirthProposal,
+        site: int,
         state: CultureState,
         lattice: Lattice,
         r_birth: float,
         birth_modifier: LocalRateModifier,
         rng: np.random.Generator,
     ) -> Optional[BirthEvent]:
-        if proposal.total_rate <= 0.0:
+        if site not in state.active_sites:
             return None
 
-        parent_idx = _sample_index_from_positive_weights(proposal.site_rates, rng)
-        parent = int(proposal.sites[parent_idx])
-
-        empty_neigh = lattice.empty_neighbor_sites(state.occupancy, parent)
+        empty_neigh = lattice.empty_neighbor_sites(state.occupancy, site)
         if empty_neigh.size == 0:
             return None
 
         if isinstance(birth_modifier, NoAdhesion):
             target = _sample_uniform_from_array(empty_neigh, rng)
-            return BirthEvent(parent=parent, target=target)
+            return BirthEvent(parent=int(site), target=target)
 
         z = lattice.coordination_number
         weights = np.empty(empty_neigh.size, dtype=float)
@@ -683,7 +743,7 @@ class CellDrivenBirthKernel(BirthKernel):
         target_idx = _sample_index_from_positive_weights(weights, rng)
         target = int(empty_neigh[target_idx])
 
-        return BirthEvent(parent=parent, target=target)
+        return BirthEvent(parent=int(site), target=target)
 
 
 class EmptyDrivenBirthKernel(BirthKernel):
@@ -691,136 +751,82 @@ class EmptyDrivenBirthKernel(BirthKernel):
     def name(self) -> str:
         return "empty_driven"
 
-    def prepare(
+    def compute_site_rate(
         self,
         state: CultureState,
         lattice: Lattice,
+        site: int,
         r_birth: float,
         birth_modifier: LocalRateModifier,
-    ) -> BirthProposal:
-        if len(state.boundary_empty_sites) == 0 or r_birth <= 0.0:
-            return BirthProposal(0.0, np.array([], dtype=int), np.array([], dtype=float))
+    ) -> float:
+        if r_birth <= 0.0:
+            return 0.0
+        if site not in state.boundary_empty_sites:
+            return 0.0
+
+        k_target = lattice.occupied_neighbor_count(state.occupancy, site)
+        if k_target == 0:
+            return 0.0
+
+        if isinstance(birth_modifier, NoAdhesion):
+            return float(r_birth * k_target)
 
         z = lattice.coordination_number
-        targets = _sorted_int_array(state.boundary_empty_sites)
-        rates = np.empty(targets.size, dtype=float)
+        local = birth_modifier.effective_rate(r_birth, k_target, z)
+        return float(k_target * local)
 
-        no_adhesion = isinstance(birth_modifier, NoAdhesion)
-
-        for i, target in enumerate(targets):
-            k_target = lattice.occupied_neighbor_count(state.occupancy, int(target))
-            if k_target == 0:
-                rates[i] = 0.0
-                continue
-
-            if no_adhesion:
-                rates[i] = r_birth * k_target
-            else:
-                local = birth_modifier.effective_rate(r_birth, k_target, z)
-                rates[i] = k_target * local
-
-        total_rate = float(rates.sum())
-        return BirthProposal(total_rate=total_rate, sites=targets, site_rates=rates)
-
-    def sample_event(
+    def sample_event_from_site(
         self,
-        proposal: BirthProposal,
+        site: int,
         state: CultureState,
         lattice: Lattice,
         r_birth: float,
         birth_modifier: LocalRateModifier,
         rng: np.random.Generator,
     ) -> Optional[BirthEvent]:
-        if proposal.total_rate <= 0.0:
+        if site not in state.boundary_empty_sites:
             return None
 
-        target_idx = _sample_index_from_positive_weights(proposal.site_rates, rng)
-        target = int(proposal.sites[target_idx])
-
-        occupied_neigh = lattice.occupied_neighbor_sites(state.occupancy, target)
+        occupied_neigh = lattice.occupied_neighbor_sites(state.occupancy, site)
         if occupied_neigh.size == 0:
             return None
 
         parent = _sample_uniform_from_array(occupied_neigh, rng)
-        return BirthEvent(parent=parent, target=target)
+        return BirthEvent(parent=parent, target=int(site))
 
 
 # ============================================================
 # Death kernel
 # ============================================================
 
-@dataclass
-class DeathProposal:
-    total_rate: float
-    sites: np.ndarray
-    site_rates: Optional[np.ndarray]
-    uniform: bool
-
-
 class DeathKernel:
-    def prepare(
+    def compute_site_rate(
         self,
         state: CultureState,
         lattice: Lattice,
+        site: int,
         r_death: float,
         death_modifier: LocalRateModifier,
-    ) -> DeathProposal:
-        if r_death <= 0.0 or state.n_cells == 0:
-            return DeathProposal(
-                total_rate=0.0,
-                sites=np.array([], dtype=int),
-                site_rates=None,
-                uniform=True,
-            )
-
-        occupied = _sorted_int_array(state.occupied_sites)
+    ) -> float:
+        if r_death <= 0.0:
+            return 0.0
+        if site not in state.occupied_sites:
+            return 0.0
 
         if isinstance(death_modifier, NoAdhesion):
-            return DeathProposal(
-                total_rate=float(r_death * occupied.size),
-                sites=occupied,
-                site_rates=None,
-                uniform=True,
-            )
+            return float(r_death)
 
         z = lattice.coordination_number
-        rates = np.empty(occupied.size, dtype=float)
-        for i, site in enumerate(occupied):
-            k_site = lattice.occupied_neighbor_count(state.occupancy, int(site))
-            rates[i] = death_modifier.effective_rate(r_death, k_site, z)
+        k_site = lattice.occupied_neighbor_count(state.occupancy, site)
+        return float(death_modifier.effective_rate(r_death, k_site, z))
 
-        return DeathProposal(
-            total_rate=float(rates.sum()),
-            sites=occupied,
-            site_rates=rates,
-            uniform=False,
-        )
-
-    def sample_event(
-        self,
-        proposal: DeathProposal,
-        rng: np.random.Generator,
-    ) -> Optional[DeathEvent]:
-        if proposal.total_rate <= 0.0 or proposal.sites.size == 0:
-            return None
-
-        if proposal.uniform:
-            site = _sample_uniform_from_array(proposal.sites, rng)
-            return DeathEvent(site=site)
-
-        idx = _sample_index_from_positive_weights(proposal.site_rates, rng)
-        site = int(proposal.sites[idx])
-        return DeathEvent(site=site)
+    def sample_event_from_site(self, site: int) -> DeathEvent:
+        return DeathEvent(site=int(site))
 
 
 # ============================================================
 # Migration placeholder
 # ============================================================
-
-@dataclass
-class MigrationProposal:
-    total_rate: float
-
 
 class MigrationKernel(ABC):
     @property
@@ -828,53 +834,11 @@ class MigrationKernel(ABC):
     def name(self) -> str:
         pass
 
-    @abstractmethod
-    def prepare(
-        self,
-        state: CultureState,
-        lattice: Lattice,
-        r_migration: float,
-        migration_modifier: LocalRateModifier,
-    ) -> MigrationProposal:
-        pass
-
-    @abstractmethod
-    def sample_event(
-        self,
-        proposal: MigrationProposal,
-        state: CultureState,
-        lattice: Lattice,
-        r_migration: float,
-        migration_modifier: LocalRateModifier,
-        rng: np.random.Generator,
-    ) -> Optional[MigrationEvent]:
-        pass
-
 
 class NoMigration(MigrationKernel):
     @property
     def name(self) -> str:
         return "no_migration"
-
-    def prepare(
-        self,
-        state: CultureState,
-        lattice: Lattice,
-        r_migration: float,
-        migration_modifier: LocalRateModifier,
-    ) -> MigrationProposal:
-        return MigrationProposal(total_rate=0.0)
-
-    def sample_event(
-        self,
-        proposal: MigrationProposal,
-        state: CultureState,
-        lattice: Lattice,
-        r_migration: float,
-        migration_modifier: LocalRateModifier,
-        rng: np.random.Generator,
-    ) -> Optional[MigrationEvent]:
-        return None
 
 
 # ============================================================
@@ -903,7 +867,7 @@ class ModelConfig:
 
 
 # ============================================================
-# Observables
+# Instant observables
 # ============================================================
 
 @dataclass
@@ -987,12 +951,114 @@ class SimulationResult:
 
 
 # ============================================================
+# Rate cache
+# ============================================================
+
+@dataclass
+class RateCache:
+    birth_rates: np.ndarray
+    death_rates: np.ndarray
+    migration_rates: np.ndarray
+    birth_tree: FenwickTree
+    death_tree: FenwickTree
+    migration_tree: FenwickTree
+
+
+# ============================================================
 # Simulator
 # ============================================================
 
 class CultureSimulator:
     def __init__(self, lattice: Lattice):
         self.lattice = lattice
+
+    def _initialize_rate_cache(
+        self,
+        state: CultureState,
+        config: ModelConfig,
+    ) -> RateCache:
+        n = self.lattice.n_sites
+
+        birth_rates = np.zeros(n, dtype=float)
+        death_rates = np.zeros(n, dtype=float)
+        migration_rates = np.zeros(n, dtype=float)
+
+        # Initialize only on currently eligible sets for births/deaths.
+        if config.r_birth > 0.0:
+            if isinstance(config.birth_kernel, CellDrivenBirthKernel):
+                candidate_birth_sites = state.active_sites
+            elif isinstance(config.birth_kernel, EmptyDrivenBirthKernel):
+                candidate_birth_sites = state.boundary_empty_sites
+            else:
+                candidate_birth_sites = set()
+
+            for site in candidate_birth_sites:
+                birth_rates[site] = config.birth_kernel.compute_site_rate(
+                    state=state,
+                    lattice=self.lattice,
+                    site=int(site),
+                    r_birth=config.r_birth,
+                    birth_modifier=config.birth_modifier,
+                )
+
+        if config.r_death > 0.0:
+            for site in state.occupied_sites:
+                death_rates[site] = config.death_kernel.compute_site_rate(
+                    state=state,
+                    lattice=self.lattice,
+                    site=int(site),
+                    r_death=config.r_death,
+                    death_modifier=config.death_modifier,
+                )
+
+        birth_tree = FenwickTree(n)
+        death_tree = FenwickTree(n)
+        migration_tree = FenwickTree(n)
+
+        birth_tree.build(birth_rates)
+        death_tree.build(death_rates)
+        migration_tree.build(migration_rates)
+
+        return RateCache(
+            birth_rates=birth_rates,
+            death_rates=death_rates,
+            migration_rates=migration_rates,
+            birth_tree=birth_tree,
+            death_tree=death_tree,
+            migration_tree=migration_tree,
+        )
+
+    def _update_local_rate_cache(
+        self,
+        state: CultureState,
+        config: ModelConfig,
+        rate_cache: RateCache,
+        affected_sites: set[int],
+    ) -> None:
+        for site in affected_sites:
+            new_birth = config.birth_kernel.compute_site_rate(
+                state=state,
+                lattice=self.lattice,
+                site=int(site),
+                r_birth=config.r_birth,
+                birth_modifier=config.birth_modifier,
+            )
+            if new_birth != rate_cache.birth_rates[site]:
+                rate_cache.birth_rates[site] = new_birth
+                rate_cache.birth_tree.set(int(site), new_birth)
+
+            new_death = config.death_kernel.compute_site_rate(
+                state=state,
+                lattice=self.lattice,
+                site=int(site),
+                r_death=config.r_death,
+                death_modifier=config.death_modifier,
+            )
+            if new_death != rate_cache.death_rates[site]:
+                rate_cache.death_rates[site] = new_death
+                rate_cache.death_tree.set(int(site), new_death)
+
+        # Migration remains zero for now.
 
     def run(
         self,
@@ -1009,10 +1075,14 @@ class CultureSimulator:
         state = initial_state.copy()
         state.initialize_frontier(self.lattice)
 
+        rate_cache = self._initialize_rate_cache(state, config)
+
         if observation_times is None:
             observation_times = [0.0, t_final]
 
         obs_times = np.array(sorted(set(float(x) for x in observation_times)), dtype=float)
+        if obs_times.size == 0:
+            raise ValueError("observation_times must be non-empty.")
         if obs_times[0] < 0 or obs_times[-1] > t_final:
             raise ValueError("observation_times must lie within [0, t_final].")
 
@@ -1053,28 +1123,9 @@ class CultureSimulator:
             obs_idx += 1
 
         while t < t_final:
-            birth_prop = config.birth_kernel.prepare(
-                state=state,
-                lattice=self.lattice,
-                r_birth=config.r_birth,
-                birth_modifier=config.birth_modifier,
-            )
-            death_prop = config.death_kernel.prepare(
-                state=state,
-                lattice=self.lattice,
-                r_death=config.r_death,
-                death_modifier=config.death_modifier,
-            )
-            migration_prop = config.migration_kernel.prepare(
-                state=state,
-                lattice=self.lattice,
-                r_migration=config.r_migration,
-                migration_modifier=config.migration_modifier,
-            )
-
-            total_birth = birth_prop.total_rate
-            total_death = death_prop.total_rate
-            total_migration = migration_prop.total_rate
+            total_birth = float(rate_cache.birth_rates.sum())
+            total_death = float(rate_cache.death_rates.sum())
+            total_migration = 0.0
             total_rate = total_birth + total_death + total_migration
 
             if total_rate <= 0.0:
@@ -1093,35 +1144,52 @@ class CultureSimulator:
                 break
 
             t += dt
-
             u = rng.random() * total_rate
 
+            applied_event = False
+
             if u < total_birth:
-                event = config.birth_kernel.sample_event(
-                    proposal=birth_prop,
+                site = rate_cache.birth_tree.sample(rng)
+                event = config.birth_kernel.sample_event_from_site(
+                    site=int(site),
                     state=state,
                     lattice=self.lattice,
                     r_birth=config.r_birth,
                     birth_modifier=config.birth_modifier,
                     rng=rng,
                 )
+
                 if event is not None:
                     state.apply_birth(event, t=t)
-                    state.update_frontier_local(self.lattice, event.target)
+                    affected_sites = state.update_frontier_local(self.lattice, event.target)
+                    self._update_local_rate_cache(
+                        state=state,
+                        config=config,
+                        rate_cache=rate_cache,
+                        affected_sites=affected_sites,
+                    )
+                    applied_event = True
 
             elif u < total_birth + total_death:
-                event = config.death_kernel.sample_event(
-                    proposal=death_prop,
-                    rng=rng,
-                )
+                site = rate_cache.death_tree.sample(rng)
+                event = config.death_kernel.sample_event_from_site(int(site))
+
                 if event is not None:
                     state.apply_death(event)
-                    state.update_frontier_local(self.lattice, event.site)
+                    affected_sites = state.update_frontier_local(self.lattice, event.site)
+                    self._update_local_rate_cache(
+                        state=state,
+                        config=config,
+                        rate_cache=rate_cache,
+                        affected_sites=affected_sites,
+                    )
+                    applied_event = True
 
             else:
                 raise NotImplementedError("Migration is not implemented yet.")
 
-            event_count += 1
+            if applied_event:
+                event_count += 1
 
             while obs_idx < len(obs_times) and obs_times[obs_idx] <= t:
                 record_current_state(float(obs_times[obs_idx]))
